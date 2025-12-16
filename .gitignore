@@ -1,0 +1,16 @@
+build/
+.vs/
+out/
+*.exe
+*.dsp
+src/save_files/
+*.pdb
+*.ilk
+*.obj
+*.tlog
+*.log
+.cache/
+.gemini/
+.idea/
+cmake-build-debug/
+.vscode/

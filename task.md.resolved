@@ -1,0 +1,14 @@
+# REL2 Project Tasks
+
+- [x] Core Infrastructure
+    - [x] Create project structure (CMake/C++)
+    - [x] Define .dsp file format
+- [/] Phase 1: .dsp File Handling
+    - [x] Implement .dsp file reader
+    - [x] Implement plotting mechanism
+- [ ] Phase 2: Alpha Vantage Integration
+    - [ ] Implement HTTP client
+    - [ ] Fetch stock data
+- [ ] Phase 3: Signal Processing
+    - [ ] Implement FFT
+    - [ ] Optimize with OpenMP

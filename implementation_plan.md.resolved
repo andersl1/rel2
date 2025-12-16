@@ -1,0 +1,63 @@
+# REL2 Implementation Plan
+
+## Goal Description
+Build a generic signal processing application that can:
+1. Read and plot data from `.dsp` files.
+2. Retrieve stock data from Alpha Vantage.
+3. Perform FFT on the data.
+4. Utilize OpenMP for parallel processing optimization.
+
+## User Review Required
+> [!IMPORTANT]
+> **Language & Framework**: I am proceeding with **C++** (using CMake) given the OpenMP requirement. Please confirm if this is correct.
+> **.dsp Format**: I need to know the structure of the `.dsp` files. Are they text-based (CSV-like) or binary? A sample or specification is needed.
+> **Plotting**: I plan to use a Python script for plotting data exported by the C++ app (e.g., via CSV) or a lightweight C++ plotting library (like plotting to a window or generating an image). Please state your preference (GUI vs Image vs External Script).
+
+## Proposed Changes
+
+### Core
+#### [NEW] [CMakeLists.txt](file:///c:/Users/ander/OneDrive/Documents/REL2/CMakeLists.txt)
+- Basic CMake setup.
+
+### Phase 1: .dsp File Handling & GUI
+#### [NEW] [CMakeLists.txt](file:///c:/Users/ander/OneDrive/Documents/REL2/CMakeLists.txt)
+- Setup project with the following dependencies via `FecthContent` or standard find:
+    - `nlohmann_json` (JSON parsing)
+    - `zstd` (Decompression)
+    - `glfw` (Windowing)
+    - `imgui` (GUI)
+    - `implot` (Plotting)
+
+#### [NEW] [src/dsp_reader.h](file:///c:/Users/ander/OneDrive/Documents/REL2/src/dsp_reader.h)
+#### [NEW] [src/dsp_reader.cpp](file:///c:/Users/ander/OneDrive/Documents/REL2/src/dsp_reader.cpp)
+- `DspReader` class:
+    - Read header (JSON metadata).
+    - Decompress Zstd blocks.
+    - Decode Signed LEB128.
+    - Undo Delta encoding.
+    - Recombine split parts (first 4 decimals + last 4 decimals).
+    - Apply inverse transformation: `y = total_investment * (exp(x) - 1)` (if needed, or just return raw).
+
+#### [NEW] [src/main.cpp](file:///c:/Users/ander/OneDrive/Documents/REL2/src/main.cpp)
+- Main application entry point.
+- Initialize GLFW/OpenGL context.
+- Setup ImGui & ImPlot.
+- Main render loop:
+    - GUI to select file.
+    - Call `DspReader`.
+    - Render plot with `ImPlot`.
+
+### Phase 2: Alpha Vantage Integration
+#### [NEW] [src/alpha_vantage.h](file:///c:/Users/ander/OneDrive/Documents/REL2/src/alpha_vantage.h)
+- HTTP Client (using `cpr` or `libcurl`) to fetch stock data.
+
+### Phase 3: Signal Processing
+#### [NEW] [src/fft_processor.h](file:///c:/Users/ander/OneDrive/Documents/REL2/src/fft_processor.h)
+- FFT implementation (using `fftw3` or custom OpenMP optimized).
+
+
+## Verification Plan
+### Automated Tests
+- Unit tests for `DspReader` with sample data.
+### Manual Verification
+- Run the app against a sample `.dsp` file and verify the plot output.
