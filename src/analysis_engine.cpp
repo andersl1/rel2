@@ -49,19 +49,33 @@ size_t AnalysisEngine::LoadLibrary(const std::string& rootPath) {
 
 double AnalysisEngine::CalculatePearson(const double* a, const double* b, size_t size) {
     if (size == 0) return 0.0;
-    double sum_a = 0.0, sum_b = 0.0, sum_ab = 0.0;
-    double sum_sq_a = 0.0, sum_sq_b = 0.0;
+
+    // Pass 1: Means
+    double mean_a = 0.0;
+    double mean_b = 0.0;
     for (size_t i = 0; i < size; ++i) {
-        double val_a = a[i];
-        double val_b = b[i];
-        sum_a += val_a; sum_b += val_b;
-        sum_ab += val_a * val_b;
-        sum_sq_a += val_a * val_a; sum_sq_b += val_b * val_b;
+        mean_a += a[i];
+        mean_b += b[i];
     }
-    double num = (static_cast<double>(size) * sum_ab) - (sum_a * sum_b);
-    double den = std::sqrt((static_cast<double>(size) * sum_sq_a - sum_a * sum_a) * 
-                           (static_cast<double>(size) * sum_sq_b - sum_b * sum_b));
+    mean_a /= size;
+    mean_b /= size;
+
+    // Pass 2: Covariance and Variances (Centered)
+    double num = 0.0;
+    double sum_sq_a = 0.0;
+    double sum_sq_b = 0.0;
+
+    for (size_t i = 0; i < size; ++i) {
+        double diff_a = a[i] - mean_a;
+        double diff_b = b[i] - mean_b;
+        num += diff_a * diff_b;
+        sum_sq_a += diff_a * diff_a;
+        sum_sq_b += diff_b * diff_b;
+    }
+
+    double den = std::sqrt(sum_sq_a * sum_sq_b);
     if (den == 0.0) return 0.0;
+
     return num / den;
 }
 

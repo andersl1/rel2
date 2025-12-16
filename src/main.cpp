@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <numeric>
+#include <chrono>
 
 // Global state
 DspData g_Data;
@@ -32,6 +33,8 @@ static char g_Symbol[32] = "IBM";
 static std::string g_AlphaStatus = "Ready";
 static std::vector<double> g_StockData;
 static std::vector<SearchResult> g_SearchResults;
+static std::vector<double> g_PredictionData; 
+static bool g_TestingMode = false; // False = Last 300 (Live), True = First 300 (Testing)
 
 static void glfw_error_callback(int error, const char* description)
 {
@@ -69,7 +72,7 @@ std::vector<double> Normalize(const std::vector<double>& input) {
     std::vector<double> out;
     out.reserve(input.size());
     if (stdev == 0) {
-        for (double v : input) out.push_back(v - mean); // Center at 0
+        for (double v : input) out.push_back(v - mean); 
     } else {
         for (double v : input) out.push_back((v - mean) / stdev);
     }
@@ -204,10 +207,18 @@ int main(int, char**)
                     ImGui::InputText("API Key", g_AlphaApiKey, sizeof(g_AlphaApiKey), ImGuiInputTextFlags_Password);
                     ImGui::InputText("Symbol", g_Symbol, sizeof(g_Symbol));
                     
+                    ImGui::Checkbox("Testing Mode (Use First 300 pts)", &g_TestingMode);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("If checked, uses FIRST 300 points. Default (Unchecked) is LAST 300 points.");
+
+                    // Persistent Query Segment for plotting (updated on fetch)
+                    static std::vector<double> s_DisplayQuery;
+                    
                     if (ImGui::Button("Fetch Data")) {
                         if (strlen(g_AlphaApiKey) == 0) {
                             g_AlphaStatus = "Error: API Key Required";
                         } else {
+                            auto start_time = std::chrono::high_resolution_clock::now();
+
                             // 1. Ensure Cache
                             auto& engine = AnalysisEngine::GetInstance();
                             if (!engine.IsLoaded()) {
@@ -225,23 +236,81 @@ int main(int, char**)
                                 // 3. Search
                                 if (g_StockData.size() >= 300) {
                                     g_AlphaStatus = "Running OpenMP Search...";
-                                    g_SearchResults = engine.Search(g_StockData, 10);
+                                    
+                                    // EXTRACT QUERY PATTERN BASED ON MODE
+                                    std::vector<double> searchPattern;
+                                    if (g_TestingMode) {
+                                        // First 300
+                                        searchPattern.assign(g_StockData.begin(), g_StockData.begin() + 300);
+                                    } else {
+                                        // Last 300
+                                        searchPattern.assign(g_StockData.end() - 300, g_StockData.end());
+                                    }
+                                    
+                                    // Save for display
+                                    s_DisplayQuery = searchPattern;
+
+                                    g_SearchResults = engine.Search(searchPattern, 10);
                                     g_AlphaStatus = "Found Top 10 Matches.";
+
+                                    // 4. Calculate Prediction
+                                    g_PredictionData.clear();
+                                    if (!g_SearchResults.empty()) {
+                                        std::vector<double> sum_returns(100, 0.0);
+                                        int count = 0;
+                                        
+                                        for (const auto& res : g_SearchResults) {
+                                            if (!res.stockPtr) continue;
+                                            
+                                            // Pattern match ends at res.offset + 300 - 1
+                                            int match_end_idx = res.offset + 300 - 1;
+                                            
+                                            // Ensure we have 100 pts after
+                                            if (match_end_idx + 100 < (int)res.stockPtr->data.size()) {
+                                                double base_val = res.stockPtr->data[match_end_idx];
+                                                if (base_val == 0) base_val = 0.0001;
+
+                                                for (int k = 0; k < 100; ++k) {
+                                                    double future_val = res.stockPtr->data[match_end_idx + 1 + k];
+                                                    double ret = (future_val - base_val) / base_val;
+                                                    sum_returns[k] += ret;
+                                                }
+                                                count++;
+                                            }
+                                        }
+
+                                        if (count > 0 && !searchPattern.empty()) {
+                                            double current_price = searchPattern.back(); // Use last point of THE PATTERN
+                                            
+                                            for (int k = 0; k < 100; ++k) {
+                                                double avg_ret = sum_returns[k] / count;
+                                                g_PredictionData.push_back(current_price * (1.0 + avg_ret));
+                                            }
+                                        }
+                                    }
+
                                 } else {
                                     g_AlphaStatus = "Data too short for search (<300).";
                                     g_SearchResults.clear();
+                                    g_PredictionData.clear();
+                                    s_DisplayQuery.clear();
                                 }
                                 
                             } catch (const std::exception& e) {
                                 g_AlphaStatus = "Error: " + std::string(e.what());
                             }
+
+                            auto end_time = std::chrono::high_resolution_clock::now();
+                            auto ms_int = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                            std::cout << "Fetch+Search Total Time: " << ms_int.count() << "ms" << std::endl;
+                            g_AlphaStatus += " (" + std::to_string(ms_int.count()) + "ms)";
                         }
                     }
                     ImGui::SameLine();
                     ImGui::Text("Status: %s", g_AlphaStatus.c_str());
                     
                     // Search Results Plot
-                    if (!g_StockData.empty()) {
+                    if (!s_DisplayQuery.empty()) {
                         ImVec2 plotSize = ImGui::GetContentRegionAvail();
                         plotSize.y -= 20;
                         if (ImPlot::BeginPlot("Search Results (Z-Scored)", plotSize)) {
@@ -252,10 +321,9 @@ int main(int, char**)
                             for (size_t i = 0; i < g_SearchResults.size(); ++i) {
                                 const auto& res = g_SearchResults[i];
                                 if (res.stockPtr) {
-                                    // Extract region 300 + 100
                                     int start = res.offset;
-                                    int len = 400; 
-                                    if (start + len > res.stockPtr->data.size()) len = res.stockPtr->data.size() - start;
+                                    int len = 400; // 300 match + 100 future
+                                    if (start + len > (int)res.stockPtr->data.size()) len = (int)res.stockPtr->data.size() - start;
                                     
                                     if (len > 0) {
                                         std::vector<double> segment(res.stockPtr->data.begin() + start, 
@@ -269,15 +337,42 @@ int main(int, char**)
                             }
 
                             // 2. Plot Query (Foreground)
-                            int queryLen = std::min((int)g_StockData.size(), 300);
-                            std::vector<double> querySeg(g_StockData.begin(), g_StockData.begin() + queryLen);
-                            std::vector<double> normQuery = Normalize(querySeg);
+                            // Use s_DisplayQuery which is the correct 300 points
+                            
+                            // Calculate Z-Score params for Query
+                            double sum = std::accumulate(s_DisplayQuery.begin(), s_DisplayQuery.end(), 0.0);
+                            double mean = sum / s_DisplayQuery.size();
+                            double sq_sum = 0.0;
+                            for (double v : s_DisplayQuery) sq_sum += (v - mean) * (v - mean);
+                            double stdev = std::sqrt(sq_sum / s_DisplayQuery.size());
+                            
+                            std::vector<double> normQuery;
+                            if (stdev != 0) {
+                                for (double v : s_DisplayQuery) normQuery.push_back((v - mean) / stdev);
+                            } else {
+                                for (double v : s_DisplayQuery) normQuery.push_back(v - mean);
+                            }
                             
                             ImPlot::SetNextLineStyle(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), 2.0f); // Bright Cyan
                             ImPlot::PlotLine("Query (300)", normQuery.data(), static_cast<int>(normQuery.size()));
 
-                            // 3. Prediction Zone vertical line
-                            ImPlot::PlotInfLines("Prediction", (double*)&queryLen, 1);
+                            // 3. Prediction Line (Appended)
+                            if (!g_PredictionData.empty()) {
+                                // Normalize prediction using Query stats
+                                std::vector<double> normPred;
+                                for (double v : g_PredictionData) {
+                                    if (stdev != 0) normPred.push_back((v - mean) / stdev);
+                                    else normPred.push_back(v - mean);
+                                }
+                                
+                                ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 2.0f); // Gold
+                                // x_starting at 300 points (end of query)
+                                ImPlot::PlotLine("Prediction (Avg)", normPred.data(), static_cast<int>(normPred.size()), 1.0, 300.0);
+                            }
+
+                            // 4. Prediction Zone vertical line
+                            double cutoff = 300.0;
+                            ImPlot::PlotInfLines("Prediction", &cutoff, 1);
 
                             ImPlot::EndPlot();
                         }

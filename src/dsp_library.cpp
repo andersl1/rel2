@@ -90,7 +90,8 @@ std::vector<DspFileEntry> DspLibrary::Scan(const std::string& rootPath) {
                 ++it;
 
             } catch (const std::exception& e) {
-                std::cerr << "Skipping entry due to error: " << e.what() << std::endl;
+                // Silenced unicode errors to prevent console spam
+                // std::cerr << "Skipping entry due to error: " << e.what() << std::endl;
                 // If the error was in processing, we need to increment to continue.
                 // BUT if increment threw, we are in trouble.
                 // Usually skip_permission_denied handles directory access issues.
