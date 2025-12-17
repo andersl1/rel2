@@ -9,6 +9,7 @@ struct CachedStock {
     std::string symbol;
     std::string fullPath;
     std::vector<double> data;
+    bool isFred;
 };
 
 struct SearchResult {
@@ -40,7 +41,7 @@ public:
     // Step 3: Search
     // Query: Must be at least 300 points.
     // Returns Top K matches from the library.
-    std::vector<SearchResult> Search(const std::vector<double>& query, int topK = 10);
+    std::vector<SearchResult> Search(const std::vector<double>& query, bool useFred, int topK = 10);
 
 private:
     std::vector<CachedStock> m_Cache;

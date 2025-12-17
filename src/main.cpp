@@ -30,13 +30,15 @@ bool g_LibraryLoaded = false;
 // Alpha Vantage & Search State
 static char g_AlphaApiKey[128] = "";
 static char g_Symbol[32] = "IBM";
-bool g_TestingMode = false; // False = Last 300 (Live), True = First 300 (Testing)
+bool g_TestingMode = false;
+bool g_UseFred = false; // Default Off // False = Last 300 (Live), True = First 300 (Testing)
 std::vector<double> g_StockData;
 std::vector<SearchResult> g_SearchResults;
 std::vector<double> g_PredictionData;
 
-struct FuturePoint { double ratio; double weight; };
+struct FuturePoint { double z; double weight; };
 std::vector<FuturePoint> g_FuturePoints;
+std::vector<double> g_MedianData;
 
 std::string g_AlphaStatus = "Idle";
 float g_Zoom = 1.0f;
@@ -215,6 +217,10 @@ int main(int, char**)
                     
                     ImGui::Checkbox("Testing Mode (Use First 300 pts)", &g_TestingMode);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("If checked, uses FIRST 300 points. Default (Unchecked) is LAST 300 points.");
+                    
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Include FRED Data", &g_UseFred);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include 100,000+ Economic Series from FRED in the search (Slower).");
 
                     // Persistent Query Segment for plotting (updated on fetch)
                     static std::vector<double> s_DisplayQuery;
@@ -258,16 +264,18 @@ int main(int, char**)
                                     }
                                     
                                     // 4. Search and Calculate Prediction
-                                    g_SearchResults = engine.Search(searchPattern, 10);
+                                    g_SearchResults = engine.Search(searchPattern, g_UseFred, 35);
                                     g_AlphaStatus = "Found Top 10 Matches.";
 
                                     g_PredictionData.clear();
                                     g_FuturePoints.clear();
+                                    g_MedianData.clear();
                                     
                                     if (!g_SearchResults.empty()) {
                                         std::vector<double> sum_returns(100, 0.0);
                                         int count = 0;
-                                        
+                                        std::vector<std::vector<double>> allSegments; // For Median
+
                                         for (const auto& res : g_SearchResults) {
                                             if (!res.stockPtr) continue;
 
@@ -284,17 +292,40 @@ int main(int, char**)
                                             
                                             // Segment Match stats
                                             double seg_sum = 0, seg_sq_sum = 0;
-                                            // Pattern match ends at res.offset + 300 - 1
                                             int match_end_idx = res.offset + 300 - 1;
                                             
-                                            // Future Point Ratio (P400 / P300)
-                                            if (res.offset + 399 < (int)scaledData.size()) {
-                                                double p300 = scaledData[match_end_idx];
-                                                double p400 = scaledData[res.offset + 399];
+                                            // Calculate stats for the match segment (for Z-score normalization)
+                                            // And accumulate for Median Calculation
+                                            if (res.offset + 300 <= (int)scaledData.size()) {
+                                                for(int k=0; k<300; ++k) {
+                                                    double val = scaledData[res.offset + k];
+                                                    seg_sum += val;
+                                                }
+                                                double seg_mean = seg_sum / 300.0;
+                                                // Re-iterate for stdev
+                                                for(int k=0; k<300; ++k) {
+                                                    double v = scaledData[res.offset + k];
+                                                    seg_sq_sum += (v - seg_mean)*(v - seg_mean);
+                                                }
+                                                double seg_stdev = std::sqrt(seg_sq_sum / 300.0);
+                                                if (seg_stdev == 0) seg_stdev = 1.0;
+
+                                                // --- 1. Store Normalized Full Segment for Median ---
+                                                int len = 400; 
+                                                if (res.offset + len > (int)scaledData.size()) len = (int)scaledData.size() - res.offset;
                                                 
-                                                if (std::abs(p300) > 1e-9) {
-                                                    double ratio = p400 / p300;
-                                                    g_FuturePoints.push_back({ratio, res.pearson});
+                                                std::vector<double> norm_full;
+                                                for(int k=0; k<len; ++k) {
+                                                    double v = scaledData[res.offset + k];
+                                                    norm_full.push_back((v - seg_mean) / seg_stdev);
+                                                }
+                                                allSegments.push_back(norm_full);
+
+                                                // --- 2. Future Point Z-Score Calculation (Robust to Negative Data) ---
+                                                if (res.offset + 399 < (int)scaledData.size()) {
+                                                    double future_val = scaledData[res.offset + 399];
+                                                    double z = (future_val - seg_mean) / seg_stdev;
+                                                    g_FuturePoints.push_back({z, res.pearson});
                                                 }
                                             }
 
@@ -309,6 +340,24 @@ int main(int, char**)
                                                     sum_returns[k] += ret;
                                                 }
                                                 count++;
+                                            }
+                                        }
+                                        
+                                        // Calculate Median Line
+                                        if (!allSegments.empty()) {
+                                            for (int t = 0; t < 400; ++t) {
+                                                std::vector<double> vals;
+                                                for (const auto& seg : allSegments) {
+                                                    if (t < (int)seg.size()) vals.push_back(seg[t]);
+                                                }
+                                                if (!vals.empty()) {
+                                                    std::sort(vals.begin(), vals.end());
+                                                    double med = vals[vals.size()/2];
+                                                    if (vals.size() % 2 == 0) {
+                                                        med = (vals[vals.size()/2 - 1] + vals[vals.size()/2]) * 0.5;
+                                                    }
+                                                    g_MedianData.push_back(med);
+                                                }
                                             }
                                         }
 
@@ -345,6 +394,7 @@ int main(int, char**)
                     // ... (UI Code Layout) ...
                     
                     if (!s_DisplayQuery.empty()) {
+                        static int s_HoveredIdx = -1;
                         if (ImGui::BeginTable("PlotLayout", 2, ImGuiTableFlags_Resizable)) {
                             ImGui::TableSetupColumn("Main Plot", ImGuiTableColumnFlags_WidthStretch, 0.8f);
                             ImGui::TableSetupColumn("EV Dist", ImGuiTableColumnFlags_WidthStretch, 0.2f);
@@ -358,8 +408,9 @@ int main(int, char**)
                             if (ImPlot::BeginPlot("Search Results (Z-Scored)", plotSize)) {
                                 ImPlot::SetupAxes("Index", "Norm Value");
                                 
+                                int new_hovered = -1;
+
                                 // 1. Plot Matches (Background)
-                                ImPlot::SetNextLineStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.3f)); // Dim gray
                                 for (size_t i = 0; i < g_SearchResults.size(); ++i) {
                                     const auto& res = g_SearchResults[i];
                                     if (res.stockPtr) {
@@ -383,9 +434,34 @@ int main(int, char**)
                                                                         scaledData.begin() + start + len);
                                             std::vector<double> norm = Normalize(segment);
                                             std::string label = res.symbol + " (D:" + std::to_string(res.distance).substr(0,4) + ")";
+                                            
+                                            // Determine Style based on Legend Hover
+                                            float alpha = 0.5f; 
+                                            float line_width = 1.0f;
+                                            if (s_HoveredIdx != -1) {
+                                                if ((int)i == s_HoveredIdx) {
+                                                    alpha = 1.0f;
+                                                    line_width = 2.0f;
+                                                } else {
+                                                    alpha = 0.05f; // Dim others significantly
+                                                }
+                                            }
+
+                                            ImPlot::SetNextLineStyle(ImVec4(0.5f, 0.5f, 0.5f, alpha), line_width);
                                             ImPlot::PlotLine(label.c_str(), norm.data(), static_cast<int>(norm.size()));
+                                            
+                                            if (ImPlot::IsLegendEntryHovered(label.c_str())) {
+                                                new_hovered = (int)i;
+                                            }
                                         }
                                     }
+                                }
+                                s_HoveredIdx = new_hovered;
+                                
+                                // Plot Median Bundle
+                                if (!g_MedianData.empty()) {
+                                    ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 2.0f); // Thick White
+                                    ImPlot::PlotLine("Median Bundle", g_MedianData.data(), static_cast<int>(g_MedianData.size()));
                                 }
 
                                 // Match Query Stats for Normalization
@@ -402,14 +478,14 @@ int main(int, char**)
                                 std::vector<double> normQuery;
                                 for (double v : s_DisplayQuery) normQuery.push_back((v - mean) / stdev);
                                 
-                                ImPlot::SetNextLineStyle(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), 2.0f); // Bright Cyan
+                                ImPlot::SetNextLineStyle(ImVec4(0.1f, 1.0f, 1.0f, 1.0f), 1.5f); // Bright Cyan
                                 ImPlot::PlotLine("Query", normQuery.data(), static_cast<int>(normQuery.size()));
 
                                 // 3. Prediction
                                 if (!g_PredictionData.empty()) {
                                     std::vector<double> normPred;
                                     for (double v : g_PredictionData) normPred.push_back((v - mean) / stdev);
-                                    ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 2.0f); // Gold
+                                    ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 1.5f); // Gold
                                     ImPlot::PlotLine("Prediction (Avg)", normPred.data(), static_cast<int>(normPred.size()), 1.0, 300.0);
                                 }
                                 
@@ -447,11 +523,8 @@ int main(int, char**)
                                     for (double y = -5.0; y <= 5.0; y += 0.1) {
                                         double d = 0;
                                         for (const auto& p : g_FuturePoints) {
-                                            // Project Ratio to Z-Score
-                                            double projected_val = query_last * p.ratio;
-                                            double projected_z = (projected_val - mean) / stdev;
-                                            
-                                            double diff = y - projected_z;
+                                            // p.z is already the Projectable Z-Score
+                                            double diff = y - p.z;
                                             d += p.weight * std::exp(-(diff*diff)/(2*sigma*sigma));
                                         }
                                         y_vals.push_back(y);
@@ -460,40 +533,43 @@ int main(int, char**)
                                     
                                     ImPlot::PlotLine("EV Density", density.data(), y_vals.data(), density.size());
                                     
-                                    // Calculate Weighted Average Ratio (EV)
+                                    // Calculate Weighted Average Z (EV)
                                     double total_weight = 0.0;
-                                    double weighted_sum_ratio = 0.0;
+                                    double weighted_sum_z = 0.0;
                                     for (const auto& p : g_FuturePoints) {
-                                        weighted_sum_ratio += p.ratio * p.weight;
+                                        weighted_sum_z += p.z * p.weight;
                                         total_weight += p.weight;
                                     }
-                                    double avg_ratio = (total_weight > 0) ? (weighted_sum_ratio / total_weight) : 1.0;
+                                    double avg_z = (total_weight > 0) ? (weighted_sum_z / total_weight) : 0.0;
 
-                                    // Project EV to Z-Space
-                                    double ev_val = query_last * avg_ratio;
-                                    double ev_z = (ev_val - mean) / stdev;
+                                    // Calculate EV % Return (Using Query Volatility)
+                                    // Projected Price = avg_z * stdev + mean
+                                    double predicted_price = avg_z * stdev + mean;
+                                    double pct = 0.0;
+                                    if (std::abs(query_last) > 1e-9) {
+                                        pct = (predicted_price - query_last) / query_last * 100.0;
+                                    }
 
-                                    // Project Breakeven (Ratio = 1.0) to Z-Space
-                                    double break_val = query_last * 1.0;
-                                    double break_z = (break_val - mean) / stdev;
+                                    // Breakeven Z (Where Price = query_last)
+                                    double break_z = (query_last - mean) / stdev;
 
-                                    // Plot Breakeven Line (White, Dotted/Thin)
+                                    // Plot Breakeven Line (Gray Dotted)
                                     double line_xs[2] = {0, 100}; 
                                     double be_ys[2] = {break_z, break_z};
                                     ImPlot::SetNextLineStyle(ImVec4(0.7f, 0.7f, 0.7f, 0.5f));
                                     ImPlot::PlotLine("Breakeven", line_xs, be_ys, 2);
 
                                     // Plot EV Line (Green/Red)
-                                    double ev_ys[2] = {ev_z, ev_z};
-                                    ImVec4 color = (avg_ratio >= 1.0) ? ImVec4(0, 1, 0, 1) : ImVec4(1, 0, 0, 1);
-                                    ImPlot::SetNextLineStyle(color, 2.0f);
+                                    double ev_ys[2] = {avg_z, avg_z};
+                                    // Green if predicted price > current price (pct > 0)
+                                    ImVec4 color = (pct >= 0) ? ImVec4(0, 1, 0, 1) : ImVec4(1, 0, 0, 1);
+                                    ImPlot::SetNextLineStyle(color, 1.5f);
                                     ImPlot::PlotLine("EV", line_xs, ev_ys, 2);
 
                                     // Annotation
-                                    double pct = (avg_ratio - 1.0) * 100.0;
                                     char label[32];
                                     sprintf(label, "EV: %+.1f%%", pct);
-                                    ImPlot::Annotation(50, ev_z, color, ImVec2(0, -10), false, "%s", label);
+                                    ImPlot::Annotation(50, avg_z, color, ImVec2(0, -10), false, "%s", label);
 
                                     // Actual Outcome Line (Testing Mode)
                                     if (g_TestingMode && s_DisplayQuery.size() > 399) {

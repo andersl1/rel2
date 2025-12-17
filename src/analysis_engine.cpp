@@ -26,7 +26,7 @@ size_t AnalysisEngine::LoadLibrary(const std::string& rootPath) {
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
         const auto& entry = entries[i];
-        if (ContainsFred(entry.fullPath)) continue;
+
 
         try {
             DspData data = DspReader::Load(entry.fullPath);
@@ -36,6 +36,7 @@ size_t AnalysisEngine::LoadLibrary(const std::string& rootPath) {
             stock.symbol = entry.displayName; 
             stock.fullPath = entry.fullPath;
             stock.data = std::move(data.values);
+            stock.isFred = ContainsFred(entry.fullPath);
 
             std::lock_guard<std::mutex> lock(cacheMutex);
             m_Cache.push_back(std::move(stock));
@@ -106,7 +107,7 @@ std::vector<double> AnalysisEngine::Downsample(const std::vector<double>& in) {
     return out;
 }
 
-std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& query, int topK) {
+std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& query, bool useFred, int topK) {
     std::vector<SearchResult> results;
     std::cout << "AnalysisEngine: Starting search on " << m_Cache.size() << " stocks. Query size: " << query.size() << std::endl;
 
@@ -122,6 +123,7 @@ std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& quer
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < static_cast<int>(m_Cache.size()); ++i) {
         const auto& stock = m_Cache[i];
+        if (!useFred && stock.isFred) continue;
         
         // Multi-Scale Search Variables
         double globalBestPearson = -1.0;
