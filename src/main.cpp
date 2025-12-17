@@ -30,11 +30,17 @@ bool g_LibraryLoaded = false;
 // Alpha Vantage & Search State
 static char g_AlphaApiKey[128] = "";
 static char g_Symbol[32] = "IBM";
-static std::string g_AlphaStatus = "Ready";
-static std::vector<double> g_StockData;
-static std::vector<SearchResult> g_SearchResults;
-static std::vector<double> g_PredictionData; 
-static bool g_TestingMode = false; // False = Last 300 (Live), True = First 300 (Testing)
+bool g_TestingMode = false; // False = Last 300 (Live), True = First 300 (Testing)
+std::vector<double> g_StockData;
+std::vector<SearchResult> g_SearchResults;
+std::vector<double> g_PredictionData;
+
+struct FuturePoint { double ratio; double weight; };
+std::vector<FuturePoint> g_FuturePoints;
+
+std::string g_AlphaStatus = "Idle";
+float g_Zoom = 1.0f;
+ImVec2 g_Pan = ImVec2(0, 0);
 
 static void glfw_error_callback(int error, const char* description)
 {
@@ -240,38 +246,65 @@ int main(int, char**)
                                     // EXTRACT QUERY PATTERN BASED ON MODE
                                     std::vector<double> searchPattern;
                                     if (g_TestingMode) {
-                                        // First 300
+                                        // First 300 for searching
                                         searchPattern.assign(g_StockData.begin(), g_StockData.begin() + 300);
+                                        // First 400 for Display (if available, to show "actual" future)
+                                        int dispLen = std::min((int)g_StockData.size(), 400);
+                                        s_DisplayQuery.assign(g_StockData.begin(), g_StockData.begin() + dispLen);
                                     } else {
-                                        // Last 300
+                                        // Last 300 for searching AND display
                                         searchPattern.assign(g_StockData.end() - 300, g_StockData.end());
+                                        s_DisplayQuery = searchPattern;
                                     }
                                     
-                                    // Save for display
-                                    s_DisplayQuery = searchPattern;
-
+                                    // 4. Search and Calculate Prediction
                                     g_SearchResults = engine.Search(searchPattern, 10);
                                     g_AlphaStatus = "Found Top 10 Matches.";
 
-                                    // 4. Calculate Prediction
                                     g_PredictionData.clear();
+                                    g_FuturePoints.clear();
+                                    
                                     if (!g_SearchResults.empty()) {
                                         std::vector<double> sum_returns(100, 0.0);
                                         int count = 0;
                                         
                                         for (const auto& res : g_SearchResults) {
                                             if (!res.stockPtr) continue;
+
+                                            // Reconstruct the data at the correct scale
+                                            std::vector<double> scaledData;
+                                            if (res.scale == 1) {
+                                                scaledData = res.stockPtr->data;
+                                            } else {
+                                                scaledData = res.stockPtr->data;
+                                                for (int s = 1; s < res.scale; s *= 2) {
+                                                    scaledData = AnalysisEngine::Downsample(scaledData);
+                                                }
+                                            }
                                             
+                                            // Segment Match stats
+                                            double seg_sum = 0, seg_sq_sum = 0;
                                             // Pattern match ends at res.offset + 300 - 1
                                             int match_end_idx = res.offset + 300 - 1;
                                             
-                                            // Ensure we have 100 pts after
-                                            if (match_end_idx + 100 < (int)res.stockPtr->data.size()) {
-                                                double base_val = res.stockPtr->data[match_end_idx];
+                                            // Future Point Ratio (P400 / P300)
+                                            if (res.offset + 399 < (int)scaledData.size()) {
+                                                double p300 = scaledData[match_end_idx];
+                                                double p400 = scaledData[res.offset + 399];
+                                                
+                                                if (std::abs(p300) > 1e-9) {
+                                                    double ratio = p400 / p300;
+                                                    g_FuturePoints.push_back({ratio, res.pearson});
+                                                }
+                                            }
+
+                                            // For Prediction Line (average returns)
+                                            if (match_end_idx + 100 < (int)scaledData.size()) {
+                                                double base_val = scaledData[match_end_idx];
                                                 if (base_val == 0) base_val = 0.0001;
 
                                                 for (int k = 0; k < 100; ++k) {
-                                                    double future_val = res.stockPtr->data[match_end_idx + 1 + k];
+                                                    double future_val = scaledData[match_end_idx + 1 + k];
                                                     double ret = (future_val - base_val) / base_val;
                                                     sum_returns[k] += ret;
                                                 }
@@ -280,8 +313,7 @@ int main(int, char**)
                                         }
 
                                         if (count > 0 && !searchPattern.empty()) {
-                                            double current_price = searchPattern.back(); // Use last point of THE PATTERN
-                                            
+                                            double current_price = searchPattern.back(); 
                                             for (int k = 0; k < 100; ++k) {
                                                 double avg_ret = sum_returns[k] / count;
                                                 g_PredictionData.push_back(current_price * (1.0 + avg_ret));
@@ -309,72 +341,174 @@ int main(int, char**)
                     ImGui::SameLine();
                     ImGui::Text("Status: %s", g_AlphaStatus.c_str());
                     
-                    // Search Results Plot
+                    // Search Results Plot Area
+                    // ... (UI Code Layout) ...
+                    
                     if (!s_DisplayQuery.empty()) {
-                        ImVec2 plotSize = ImGui::GetContentRegionAvail();
-                        plotSize.y -= 20;
-                        if (ImPlot::BeginPlot("Search Results (Z-Scored)", plotSize)) {
-                            ImPlot::SetupAxes("Index", "Norm Value");
+                        if (ImGui::BeginTable("PlotLayout", 2, ImGuiTableFlags_Resizable)) {
+                            ImGui::TableSetupColumn("Main Plot", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                            ImGui::TableSetupColumn("EV Dist", ImGuiTableColumnFlags_WidthStretch, 0.2f);
                             
-                            // 1. Plot Matches (Background)
-                            ImPlot::SetNextLineStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.3f)); // Dim gray
-                            for (size_t i = 0; i < g_SearchResults.size(); ++i) {
-                                const auto& res = g_SearchResults[i];
-                                if (res.stockPtr) {
-                                    int start = res.offset;
-                                    int len = 400; // 300 match + 100 future
-                                    if (start + len > (int)res.stockPtr->data.size()) len = (int)res.stockPtr->data.size() - start;
-                                    
-                                    if (len > 0) {
-                                        std::vector<double> segment(res.stockPtr->data.begin() + start, 
-                                                                    res.stockPtr->data.begin() + start + len);
-                                        std::vector<double> norm = Normalize(segment);
+                            ImGui::TableNextRow();
+                            
+                            // --- COLUMN 0: Main Plot ---
+                            ImGui::TableSetColumnIndex(0);
+                            ImVec2 plotSize = ImGui::GetContentRegionAvail();
+                            plotSize.y -= 5; 
+                            if (ImPlot::BeginPlot("Search Results (Z-Scored)", plotSize)) {
+                                ImPlot::SetupAxes("Index", "Norm Value");
+                                
+                                // 1. Plot Matches (Background)
+                                ImPlot::SetNextLineStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.3f)); // Dim gray
+                                for (size_t i = 0; i < g_SearchResults.size(); ++i) {
+                                    const auto& res = g_SearchResults[i];
+                                    if (res.stockPtr) {
+                                        // Reconstruct Scaled Data
+                                        std::vector<double> scaledData;
+                                        if (res.scale == 1) {
+                                            scaledData = res.stockPtr->data;
+                                        } else {
+                                            scaledData = res.stockPtr->data;
+                                            for (int s = 1; s < res.scale; s *= 2) {
+                                                scaledData = AnalysisEngine::Downsample(scaledData);
+                                            }
+                                        }
+
+                                        int start = res.offset;
+                                        int len = 400; // 300 match + 100 future
+                                        if (start + len > (int)scaledData.size()) len = (int)scaledData.size() - start;
                                         
-                                        std::string label = res.symbol + " (P:" + std::to_string(res.pearson).substr(0,4) + ")";
-                                        ImPlot::PlotLine(label.c_str(), norm.data(), static_cast<int>(norm.size()));
+                                        if (len > 0) {
+                                            std::vector<double> segment(scaledData.begin() + start, 
+                                                                        scaledData.begin() + start + len);
+                                            std::vector<double> norm = Normalize(segment);
+                                            std::string label = res.symbol + " (D:" + std::to_string(res.distance).substr(0,4) + ")";
+                                            ImPlot::PlotLine(label.c_str(), norm.data(), static_cast<int>(norm.size()));
+                                        }
                                     }
                                 }
-                            }
 
-                            // 2. Plot Query (Foreground)
-                            // Use s_DisplayQuery which is the correct 300 points
-                            
-                            // Calculate Z-Score params for Query
-                            double sum = std::accumulate(s_DisplayQuery.begin(), s_DisplayQuery.end(), 0.0);
-                            double mean = sum / s_DisplayQuery.size();
-                            double sq_sum = 0.0;
-                            for (double v : s_DisplayQuery) sq_sum += (v - mean) * (v - mean);
-                            double stdev = std::sqrt(sq_sum / s_DisplayQuery.size());
-                            
-                            std::vector<double> normQuery;
-                            if (stdev != 0) {
+                                // Match Query Stats for Normalization
+                                int patternLen = std::min((int)s_DisplayQuery.size(), 300);
+                                double sum = 0.0;
+                                for(int i=0; i<patternLen; ++i) sum += s_DisplayQuery[i];
+                                double mean = sum / patternLen;
+                                double sq_sum = 0.0;
+                                for(int i=0; i<patternLen; ++i) sq_sum += (s_DisplayQuery[i] - mean) * (s_DisplayQuery[i] - mean);
+                                double stdev = std::sqrt(sq_sum / patternLen);
+                                if (stdev == 0) stdev = 1.0; 
+
+                                // 2. Plot Query (Foreground)
+                                std::vector<double> normQuery;
                                 for (double v : s_DisplayQuery) normQuery.push_back((v - mean) / stdev);
-                            } else {
-                                for (double v : s_DisplayQuery) normQuery.push_back(v - mean);
-                            }
-                            
-                            ImPlot::SetNextLineStyle(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), 2.0f); // Bright Cyan
-                            ImPlot::PlotLine("Query (300)", normQuery.data(), static_cast<int>(normQuery.size()));
+                                
+                                ImPlot::SetNextLineStyle(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), 2.0f); // Bright Cyan
+                                ImPlot::PlotLine("Query", normQuery.data(), static_cast<int>(normQuery.size()));
 
-                            // 3. Prediction Line (Appended)
-                            if (!g_PredictionData.empty()) {
-                                // Normalize prediction using Query stats
-                                std::vector<double> normPred;
-                                for (double v : g_PredictionData) {
-                                    if (stdev != 0) normPred.push_back((v - mean) / stdev);
-                                    else normPred.push_back(v - mean);
+                                // 3. Prediction
+                                if (!g_PredictionData.empty()) {
+                                    std::vector<double> normPred;
+                                    for (double v : g_PredictionData) normPred.push_back((v - mean) / stdev);
+                                    ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 2.0f); // Gold
+                                    ImPlot::PlotLine("Prediction (Avg)", normPred.data(), static_cast<int>(normPred.size()), 1.0, 300.0);
                                 }
                                 
-                                ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 2.0f); // Gold
-                                // x_starting at 300 points (end of query)
-                                ImPlot::PlotLine("Prediction (Avg)", normPred.data(), static_cast<int>(normPred.size()), 1.0, 300.0);
+                                // 4. Prediction Zone Line
+                                double cutoff = 300.0;
+                                ImPlot::PlotInfLines("Prediction", &cutoff, 1);
+
+                                ImPlot::EndPlot();
                             }
 
-                            // 4. Prediction Zone vertical line
-                            double cutoff = 300.0;
-                            ImPlot::PlotInfLines("Prediction", &cutoff, 1);
+                            // --- COLUMN 1: EV Distribution ---
+                            ImGui::TableSetColumnIndex(1);
+                            if (ImPlot::BeginPlot("EV Dist", ImVec2(-1, plotSize.y))) {
+                                ImPlot::SetupAxes("Density", "Z-Score");
+                                
+                                if (!g_FuturePoints.empty()) {
+                                    // 1. Calculate Query Stats (Same as Main Plot)
+                                    int patternLen = std::min((int)s_DisplayQuery.size(), 300);
+                                    double sum = 0.0;
+                                    for(int i=0; i<patternLen; ++i) sum += s_DisplayQuery[i];
+                                    double mean = sum / patternLen;
+                                    double sq_sum = 0.0;
+                                    for(int i=0; i<patternLen; ++i) sq_sum += (s_DisplayQuery[i] - mean) * (s_DisplayQuery[i] - mean);
+                                    double stdev = std::sqrt(sq_sum / patternLen);
+                                    if (stdev == 0) stdev = 1.0;
+                                    
+                                    double query_last = s_DisplayQuery[patternLen - 1];
 
-                            ImPlot::EndPlot();
+                                    // 2. Generate KDE
+                                    std::vector<double> y_vals;
+                                    std::vector<double> density;
+                                    double sigma = 0.3; 
+                                    
+                                    // Iterate Y (Z-Score space)
+                                    for (double y = -5.0; y <= 5.0; y += 0.1) {
+                                        double d = 0;
+                                        for (const auto& p : g_FuturePoints) {
+                                            // Project Ratio to Z-Score
+                                            double projected_val = query_last * p.ratio;
+                                            double projected_z = (projected_val - mean) / stdev;
+                                            
+                                            double diff = y - projected_z;
+                                            d += p.weight * std::exp(-(diff*diff)/(2*sigma*sigma));
+                                        }
+                                        y_vals.push_back(y);
+                                        density.push_back(d);
+                                    }
+                                    
+                                    ImPlot::PlotLine("EV Density", density.data(), y_vals.data(), density.size());
+                                    
+                                    // Calculate Weighted Average Ratio (EV)
+                                    double total_weight = 0.0;
+                                    double weighted_sum_ratio = 0.0;
+                                    for (const auto& p : g_FuturePoints) {
+                                        weighted_sum_ratio += p.ratio * p.weight;
+                                        total_weight += p.weight;
+                                    }
+                                    double avg_ratio = (total_weight > 0) ? (weighted_sum_ratio / total_weight) : 1.0;
+
+                                    // Project EV to Z-Space
+                                    double ev_val = query_last * avg_ratio;
+                                    double ev_z = (ev_val - mean) / stdev;
+
+                                    // Project Breakeven (Ratio = 1.0) to Z-Space
+                                    double break_val = query_last * 1.0;
+                                    double break_z = (break_val - mean) / stdev;
+
+                                    // Plot Breakeven Line (White, Dotted/Thin)
+                                    double line_xs[2] = {0, 100}; 
+                                    double be_ys[2] = {break_z, break_z};
+                                    ImPlot::SetNextLineStyle(ImVec4(0.7f, 0.7f, 0.7f, 0.5f));
+                                    ImPlot::PlotLine("Breakeven", line_xs, be_ys, 2);
+
+                                    // Plot EV Line (Green/Red)
+                                    double ev_ys[2] = {ev_z, ev_z};
+                                    ImVec4 color = (avg_ratio >= 1.0) ? ImVec4(0, 1, 0, 1) : ImVec4(1, 0, 0, 1);
+                                    ImPlot::SetNextLineStyle(color, 2.0f);
+                                    ImPlot::PlotLine("EV", line_xs, ev_ys, 2);
+
+                                    // Annotation
+                                    double pct = (avg_ratio - 1.0) * 100.0;
+                                    char label[32];
+                                    sprintf(label, "EV: %+.1f%%", pct);
+                                    ImPlot::Annotation(50, ev_z, color, ImVec2(0, -10), false, "%s", label);
+
+                                    // Actual Outcome Line (Testing Mode)
+                                    if (g_TestingMode && s_DisplayQuery.size() > 399) {
+                                        double actual_val = s_DisplayQuery[399];
+                                        double actual_z = (actual_val - mean) / stdev;
+                                        
+                                        double actual_ys[2] = {actual_z, actual_z};
+                                        ImPlot::SetNextLineStyle(ImVec4(0,1,1,1));
+                                        ImPlot::PlotLine("Actual", line_xs, actual_ys, 2);
+                                    }
+                                }
+                                ImPlot::EndPlot();
+                            }
+                            
+                            ImGui::EndTable();
                         }
                     }
 

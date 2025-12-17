@@ -14,6 +14,7 @@ struct CachedStock {
 struct SearchResult {
     std::string symbol;
     int offset; // Starting index in the target stock
+    int scale;  // Downsampling scale (1, 2, 4...)
     double pearson;
     double distance; // Hyperspherical distance
     const CachedStock* stockPtr; // Fast access to data
@@ -27,6 +28,7 @@ public:
         return instance;
     }
 
+    static std::vector<double> Downsample(const std::vector<double>& in);
     size_t LoadLibrary(const std::string& rootPath);
     const std::vector<CachedStock>& GetCache() const { return m_Cache; }
     bool IsLoaded() const { return m_Loaded; }

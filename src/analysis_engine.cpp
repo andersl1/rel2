@@ -96,12 +96,24 @@ double AnalysisEngine::CalculateHyperspherical(const double* a, const double* b,
     return std::acos(cosine);
 }
 
+// Helper to downsample by 2 (averaging)
+std::vector<double> AnalysisEngine::Downsample(const std::vector<double>& in) {
+    std::vector<double> out;
+    out.reserve(in.size() / 2);
+    for (size_t i = 0; i + 1 < in.size(); i += 2) {
+        out.push_back((in[i] + in[i+1]) * 0.5);
+    }
+    return out;
+}
+
 std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& query, int topK) {
     std::vector<SearchResult> results;
     std::cout << "AnalysisEngine: Starting search on " << m_Cache.size() << " stocks. Query size: " << query.size() << std::endl;
 
     // Use first 300 points of query as the pattern
     const size_t patternSize = 300;
+    if (query.size() < patternSize) return results; // Safety check
+
     const std::vector<double> pattern(query.begin(), query.begin() + patternSize);
 
     // Thread-local storage for gathering results
@@ -109,32 +121,67 @@ std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& quer
 
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < static_cast<int>(m_Cache.size()); ++i) {
-        // ... (loop content same) ...
         const auto& stock = m_Cache[i];
-        const int searchLimit = static_cast<int>(stock.data.size()) - 100 - static_cast<int>(patternSize);
+        
+        // Multi-Scale Search Variables
+        double globalBestPearson = -1.0;
+        int globalBestOffset = -1;
+        int globalBestScale = 1;
+        
+        // Create a copy for downsampling
+        std::vector<double> currentData = stock.data;
+        int currentScale = 1;
 
-        if (searchLimit < 0) continue; 
+        // Loop through scales
+        // Condition: we need at least 400 points (300 match + 100 buffer/future)
+        // Wait, downsampling logic says "3000 -> 1500 ... NOT 375".
+        // The original check was size >= 400. 
+        // With pattern size 300, we need at least 300 points to match.
+        // User implied filtering files < 400.
+        // For search, we extract pattern of 300. So target must be >= 300.
+        // With 100 padding, ideally >= 400.
+        while (currentData.size() >= 400) {
+            
+            const int searchLimit = static_cast<int>(currentData.size()) - 100 - static_cast<int>(patternSize);
 
-        double bestPearson = -1.0;
-        int bestOffset = -1;
+            if (searchLimit >= 0) {
+                double localBestPearson = -1.0;
+                int localBestOffset = -1;
 
-        for (int j = 0; j <= searchLimit; ++j) {
-            double p = CalculatePearson(pattern.data(), stock.data.data() + j, patternSize);
-            if (p > bestPearson) {
-                bestPearson = p;
-                bestOffset = j;
+                // Search at this scale
+                for (int j = 0; j <= searchLimit; ++j) {
+                    double p = CalculatePearson(pattern.data(), currentData.data() + j, patternSize);
+                    if (p > localBestPearson) {
+                        localBestPearson = p;
+                        localBestOffset = j;
+                    }
+                }
+
+                if (localBestPearson > globalBestPearson) {
+                    globalBestPearson = localBestPearson;
+                    globalBestOffset = localBestOffset;
+                    globalBestScale = currentScale;
+                }
             }
+
+            // Prepare next scale
+            currentData = Downsample(currentData);
+            currentScale *= 2;
         }
 
-        if (bestOffset != -1) {
-            // Optimization: Only store if pearson is somewhat decent? e.g. > 0.0
-            // But user wants Top 10, even if bad.
-            double dist = CalculateHyperspherical(pattern.data(), stock.data.data() + bestOffset, patternSize);
+        // Check Threshold logic (User requirement: discard if < 0.7)
+        if (globalBestOffset != -1 && globalBestPearson >= 0.7) {
+            
+            // "Invariant to Y stretching" Distance is simply derived from Pearson.
+            // Pearson = Cosine of Centered Vectors.
+            // Distance = acos(Pearson).
+            double dist = std::acos(std::max(-1.0, std::min(1.0, globalBestPearson)));
             
             SearchResult res;
             res.symbol = stock.symbol;
-            res.offset = bestOffset;
-            res.pearson = bestPearson;
+            res.offset = globalBestOffset;
+            res.scale = globalBestScale;
+            res.pearson = globalBestPearson;
             res.distance = dist;
             res.stockPtr = &stock;
 
@@ -150,9 +197,10 @@ std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& quer
     
     std::cout << "AnalysisEngine: Merged " << results.size() << " results." << std::endl;
 
-    // Sort by Pearson (Descending)
+    // Sort by Hyperspherical Distance (Ascending: 0 is best)
+    // Note: Since Distance = acos(Pearson), Sorting by Distance Ascending is IDENTICAL to Pearson Descending.
     std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
-        return a.pearson > b.pearson;
+        return a.distance < b.distance;
     });
 
     // Keep Top K
@@ -161,7 +209,7 @@ std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& quer
     }
     
     if (!results.empty()) {
-        std::cout << "AnalysisEngine: Top Match: " << results[0].symbol << " (Pearson: " << results[0].pearson << ")" << std::endl;
+        std::cout << "AnalysisEngine: Top Match: " << results[0].symbol << " (Dist: " << results[0].distance << ", Pearson: " << results[0].pearson << ")" << std::endl;
     }
 
     return results;
