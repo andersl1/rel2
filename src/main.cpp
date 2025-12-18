@@ -16,7 +16,38 @@
 #include <numeric>
 #include <chrono>
 
+#include <chrono>
+#include <fstream>
+#include <random>
+#include <thread>
+#include <mutex>
+#include <deque>
+
+// Simulation Structs
+struct SimResult {
+    std::string ticker;
+    double start_price;
+    double end_price;
+    double predicted_ev; // Expected Value %
+    double actual_return; // Actual Return %
+    double wallet_before;
+    double wallet_after;
+    std::string decision; // "Buy", "Short", "Skip"
+    bool win;
+};
+
+// Global Simulation State
+std::vector<std::string> g_TickerList;
+std::vector<SimResult> g_SimHistory;
+double g_SimWallet = 100.0;
+bool g_SimRunning = false;
+bool g_SimStopRequest = false;
+std::mutex g_SimMutex;
+std::string g_SimStatus = "Idle";
+bool g_SimRateLimit = true; // Default to Rate Limited (Free Tier)
+
 // Global state
+
 DspData g_Data;
 char g_FilePath[1024] = "C:/Users/ander/OneDrive/Documents/REL2/src/save_files/PEBO20(S1).dsp"; 
 std::string g_StatusMessage = "Ready";
@@ -87,6 +118,237 @@ std::vector<double> Normalize(const std::vector<double>& input) {
     return out;
 }
 
+
+// Helper to Load Tickers
+void LoadTickers() {
+    g_TickerList.clear();
+    std::ifstream file("C:/Users/ander/OneDrive/Documents/REL2/src/tickers/saved_tickers.txt");
+    if (file.is_open()) {
+        std::string line;
+        while (std::getline(file, line)) {
+            // Trim whitespace
+            line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+            line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+            if (!line.empty()) {
+                g_TickerList.push_back(line);
+            }
+        }
+        file.close();
+        std::cout << "Loaded " << g_TickerList.size() << " tickers for simulation." << std::endl;
+    } else {
+        std::cerr << "Failed to load tickers from saved_tickers.txt" << std::endl;
+    }
+}
+
+// Simulation Thread Function
+void RunSimulation(std::string apiKey) {
+    std::cout << "Simulation Started." << std::endl;
+    
+    // Ensure Library is Loaded (should be done in main, but safe to check)
+    auto& engine = AnalysisEngine::GetInstance();
+    if (!engine.IsLoaded()) {
+        std::string root = DspLibrary::FindRoot();
+        engine.LoadLibrary(root);
+    }
+    
+    int games_played = 0;
+    
+    // Random Number Generation
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    
+    while (g_SimRunning) {
+        {
+            std::lock_guard<std::mutex> lock(g_SimMutex);
+            if (g_SimStopRequest || g_SimWallet <= 0 || g_SimHistory.size() >= 100) {
+                g_SimRunning = false;
+                g_SimStatus = "Finished";
+                break;
+            }
+        }
+        
+        if (g_TickerList.empty()) {
+            std::lock_guard<std::mutex> lock(g_SimMutex);
+            g_SimStatus = "Error: No Tickers";
+            g_SimRunning = false;
+            break;
+        }
+
+        // Pick Random Ticker
+        std::uniform_int_distribution<> distr(0, g_TickerList.size() - 1);
+        std::string ticker = g_TickerList[distr(gen)];
+        
+        {
+            std::lock_guard<std::mutex> lock(g_SimMutex);
+            g_SimStatus = "Fetching " + ticker + "...";
+        }
+        
+        try {
+            std::vector<double> data = AlphaVantage::FetchDaily(ticker, apiKey);
+            
+            if (data.size() < 400) {
+                // Skip if not enough data for testing
+                if (g_SimRateLimit) std::this_thread::sleep_for(std::chrono::seconds(12));
+                continue; 
+            }
+            
+            
+            // Random Slice (Feature Check)
+            int data_size = static_cast<int>(data.size());
+            // Need: 300 for query + 100 for future = 400 total window.
+            int max_start = data_size - 400;
+            if (max_start < 0) { // Safety
+                 if (g_SimRateLimit) std::this_thread::sleep_for(std::chrono::seconds(12));
+                 continue;
+            }
+            
+            std::uniform_int_distribution<> slice_dist(0, max_start);
+            int start_idx = slice_dist(gen);
+            
+            // Testing Mode: Use Random 300
+            std::vector<double> query(data.begin() + start_idx, data.begin() + start_idx + 300);
+            
+            // Actual Future (Index 399 relative to start_idx, i.e., 100 steps ahead of match end)
+            double actual_start = data[start_idx + 299]; // Price at end of query
+            double actual_end = data[start_idx + 399];   // Price 100 days later
+            double actual_return_pct = (actual_end - actual_start) / actual_start * 100.0;
+            
+            // Run Search
+            {
+                std::lock_guard<std::mutex> lock(g_SimMutex);
+                g_SimStatus = "Analyzing " + ticker + "...";
+            }
+            
+            std::vector<SearchResult> results = engine.Search(query, false, 35); // topK=35 for better density
+            
+            // Calculate EV
+            // 1. Query Stats
+            double q_sum = std::accumulate(query.begin(), query.end(), 0.0);
+            double q_mean = q_sum / query.size();
+            double q_sq_sum = 0.0;
+            for (double v : query) q_sq_sum += (v - q_mean) * (v - q_mean);
+            double q_stdev = std::sqrt(q_sq_sum / query.size());
+            if (q_stdev == 0) q_stdev = 1.0;
+            
+            // 2. Future Points
+            std::vector<struct FuturePoint> points;
+            for (const auto& res : results) {
+                if (!res.stockPtr) continue;
+                std::vector<double> scaledData;
+                 if (res.scale == 1) {
+                    scaledData = res.stockPtr->data;
+                } else {
+                    scaledData = res.stockPtr->data;
+                    for (int s = 1; s < res.scale; s *= 2) {
+                        scaledData = AnalysisEngine::Downsample(scaledData);
+                    }
+                }
+                
+                // Match stats for normalization
+                double seg_sum = 0, seg_sq_sum = 0;
+                int match_len = 300;
+                if (res.offset + match_len <= (int)scaledData.size()) {
+                    for(int k=0; k<match_len; ++k) seg_sum += scaledData[res.offset + k];
+                    double seg_mean = seg_sum / match_len;
+                    for(int k=0; k<match_len; ++k) {
+                        double v = scaledData[res.offset + k];
+                        seg_sq_sum += (v - seg_mean)*(v - seg_mean);
+                    }
+                    double seg_stdev = std::sqrt(seg_sq_sum / match_len);
+                    if (seg_stdev == 0) seg_stdev = 1.0;
+                    
+                    // Future Point (at +399 relative to offset start? i.e. 100 days after match end)
+                    if (res.offset + 399 < (int)scaledData.size()) {
+                        double future_val = scaledData[res.offset + 399];
+                        double z = (future_val - seg_mean) / seg_stdev;
+                        points.push_back({z, res.pearson});
+                    }
+                }
+            }
+            
+            // 3. Weighted Average (EV)
+            double predicted_ev_pct = 0.0;
+            double avg_z = 0.0;
+            if (!points.empty()) {
+                double total_weight = 0.0;
+                double weighted_sum_z = 0.0;
+                for (const auto& p : points) {
+                    weighted_sum_z += p.z * p.weight;
+                    total_weight += p.weight;
+                }
+                avg_z = (total_weight > 0) ? (weighted_sum_z / total_weight) : 0.0;
+                
+                double predicted_price = avg_z * q_stdev + q_mean;
+                double query_last = query.back();
+                if (std::abs(query_last) > 1e-9) {
+                    predicted_ev_pct = (predicted_price - query_last) / query_last * 100.0;
+                }
+            }
+            
+            // Decision
+            std::string decision = "Skip";
+            double bet_return = 0.0;
+            bool win = false;
+            
+            if (predicted_ev_pct > 0.5) { // Threshold for long
+                decision = "Buy";
+                bet_return = actual_return_pct; 
+            } else if (predicted_ev_pct < -0.5) { // Threshold for short
+                decision = "Short";
+                bet_return = -actual_return_pct;
+            }
+            
+            // Update Wallet
+            {
+                std::lock_guard<std::mutex> lock(g_SimMutex);
+                
+                SimResult res;
+                res.ticker = ticker;
+                res.start_price = actual_start;
+                res.end_price = actual_end;
+                res.predicted_ev = predicted_ev_pct;
+                res.actual_return = actual_return_pct;
+                res.wallet_before = g_SimWallet;
+                
+                if (decision != "Skip") {
+                    // Fixed Fractional Betting (25% of Wallet)
+                    double bet_size = g_SimWallet * 0.25; 
+                    double profit = bet_size * (bet_return / 100.0);
+                    g_SimWallet += profit;
+                    
+                    if (bet_return > 0) win = true;
+                }
+                
+                res.wallet_after = g_SimWallet;
+                res.decision = decision;
+                res.win = win;
+                
+                g_SimHistory.push_back(res);
+                g_SimStatus = "Result: " + decision + " " + ticker + " (Ret: " + std::to_string(bet_return) + "%)";
+            }
+            
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(g_SimMutex);
+            g_SimStatus = "Error on " + ticker + ": " + e.what();
+        }
+        
+        // Rate Limit
+        if (g_SimRateLimit && g_SimRunning) {
+             std::this_thread::sleep_for(std::chrono::seconds(12));
+        } else if (g_SimRunning) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
+        }
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(g_SimMutex);
+        g_SimRunning = false;
+        if (g_SimStatus != "Finished") g_SimStatus = "Stopped";
+    }
+}
+
+
+
 int main(int, char**)
 {
     glfwSetErrorCallback(glfw_error_callback);
@@ -128,7 +390,11 @@ int main(int, char**)
         }
     }
 
+    // Load Tickers
+    LoadTickers();
+
     while (!glfwWindowShouldClose(window))
+
     {
         glfwPollEvents();
 
@@ -590,6 +856,125 @@ int main(int, char**)
 
                     ImGui::EndTabItem();
                 }
+
+                // Tab 3: Simulate
+                if (ImGui::BeginTabItem("Simulate")) {
+                    ImGui::Text("Simulation Mode: Backtest strategy on random tickers.");
+                    ImGui::InputText("API Key", g_AlphaApiKey, sizeof(g_AlphaApiKey), ImGuiInputTextFlags_Password);
+                    ImGui::Checkbox("Rate Limit (Free Tier - 12s delay)", &g_SimRateLimit);
+                    
+                    ImGui::Separator();
+                    
+                    { // Lock for reading UI state
+                        std::lock_guard<std::mutex> lock(g_SimMutex);
+                        ImGui::Text("Wallet: $%.2f", g_SimWallet);
+                        ImGui::SameLine();
+                        if (g_SimRunning) {
+                            if (ImGui::Button("Stop Simulation")) {
+                                g_SimStopRequest = true;
+                            }
+                            ImGui::Text("Status: Running... %s", g_SimStatus.c_str());
+                        } else {
+                            if (ImGui::Button("Run Simulation")) {
+                                if (strlen(g_AlphaApiKey) > 0 && !g_TickerList.empty()) {
+                                    g_SimRunning = true;
+                                    g_SimStopRequest = false;
+                                    g_SimStatus = "Starting...";
+                                    // Reset if finished or empty
+                                    if (g_SimStatus == "Finished" || g_SimWallet <= 0 || g_SimHistory.size() >= 100) {
+                                         g_SimWallet = 100.0;
+                                         g_SimHistory.clear();
+                                    }
+                                    std::thread(RunSimulation, std::string(g_AlphaApiKey)).detach();
+                                } else {
+                                    g_SimStatus = "Error: API Key missing or No Tickers.";
+                                }
+                            }
+                            ImGui::SameLine(); 
+                            if (ImGui::Button("Reset")) {
+                                g_SimWallet = 100.0;
+                                g_SimHistory.clear();
+                            }
+                            ImGui::Text("Status: %s", g_SimStatus.c_str());
+                        }
+                    
+                        // Statistic & Plot
+                        ImGui::Separator();
+                        
+                        // Calculate Stats
+                        int wins = 0, losses = 0;
+                        std::vector<double> x, y;
+                        x.reserve(g_SimHistory.size() + 1);
+                        y.reserve(g_SimHistory.size() + 1);
+                        
+                        x.push_back(0);
+                        y.push_back(100.0); // Start
+                        
+                        int idx = 1;
+                        for (const auto& h : g_SimHistory) { 
+                            if (h.decision != "Skip") {
+                                if (h.win) wins++; else losses++;
+                            }
+                            x.push_back((double)idx++);
+                            y.push_back(h.wallet_after);
+                        }
+                        
+                        double ratio = 0.0;
+                        if (wins + losses > 0) ratio = (double)wins / (wins + losses) * 100.0;
+                        
+                        ImGui::TextColored(ImVec4(1, 1, 0, 1), "Wins: %d | Losses: %d | Ratio: %.1f%%", wins, losses, ratio);
+                        
+                        if (x.size() > 1) {
+                             // ImVec2(-1, -1) will use all remaining width and height
+                             if (ImPlot::BeginPlot("Equity Curve", ImVec2(-1, -1))) {
+                                 ImPlot::SetupAxes("Trades", "Wallet ($)");
+                                 ImPlot::PlotLine("Value", x.data(), y.data(), static_cast<int>(x.size()));
+                                 ImPlot::EndPlot();
+                             }
+                        }
+                    }
+
+                    ImGui::Separator();
+                    
+                    // History Table
+                    if (ImGui::BeginTable("SimHistory", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, -1))) {
+                        ImGui::TableSetupColumn("Ticker");
+                        ImGui::TableSetupColumn("Decision");
+                        ImGui::TableSetupColumn("Target EV");
+                        ImGui::TableSetupColumn("Actual");
+                        ImGui::TableSetupColumn("Win?");
+                        ImGui::TableSetupColumn("Wallet");
+                        ImGui::TableHeadersRow();
+                        
+                        std::lock_guard<std::mutex> lock(g_SimMutex);
+                        // Show in reverse order (newest first)
+                        for (auto it = g_SimHistory.rbegin(); it != g_SimHistory.rend(); ++it) {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0); ImGui::Text("%s", it->ticker.c_str());
+                            ImGui::TableSetColumnIndex(1); 
+                            ImVec4 color = ImVec4(1,1,1,1);
+                            if (it->decision == "Buy") color = ImVec4(0,1,0,1);
+                            if (it->decision == "Short") color = ImVec4(1,0,0,1);
+                            ImGui::TextColored(color, "%s", it->decision.c_str());
+                            
+                            ImGui::TableSetColumnIndex(2); ImGui::Text("%+.2f%%", it->predicted_ev);
+                            ImGui::TableSetColumnIndex(3); ImGui::Text("%+.2f%%", it->actual_return);
+                            
+                            ImGui::TableSetColumnIndex(4); 
+                            if (it->decision != "Skip") {
+                                ImGui::TextColored(it->win ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1), "%s", it->win ? "WIN" : "LOSS");
+                            } else {
+                                ImGui::Text("-");
+                            }
+                            
+                            ImGui::TableSetColumnIndex(5); ImGui::Text("$%.2f", it->wallet_after);
+                        }
+                        ImGui::EndTable();
+                    }
+
+                    ImGui::EndTabItem();
+                }
+
 
                 ImGui::EndTabBar();
             }
