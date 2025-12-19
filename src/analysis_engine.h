@@ -39,9 +39,9 @@ public:
     static double CalculateHyperspherical(const double* a, const double* b, size_t size);
 
     // Step 3: Search
-    // Query: Must be at least 300 points.
+    // Query: Uses entire query as pattern.
     // Returns Top K matches from the library.
-    std::vector<SearchResult> Search(const std::vector<double>& query, bool useFred, int topK = 10);
+    std::vector<SearchResult> Search(const std::vector<double>& query, bool useFred, int topK = 10, int lookahead = 100);
 
 private:
     std::vector<CachedStock> m_Cache;

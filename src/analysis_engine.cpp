@@ -107,15 +107,17 @@ std::vector<double> AnalysisEngine::Downsample(const std::vector<double>& in) {
     return out;
 }
 
-std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& query, bool useFred, int topK) {
+std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& query, bool useFred, int topK, int lookahead) {
     std::vector<SearchResult> results;
-    std::cout << "AnalysisEngine: Starting search on " << m_Cache.size() << " stocks. Query size: " << query.size() << std::endl;
+    
+    // Use entire query as pattern
+    const size_t patternSize = query.size();
+    if (patternSize < 10) return results; // Minimum safety checks
 
-    // Use first 300 points of query as the pattern
-    const size_t patternSize = 300;
-    if (query.size() < patternSize) return results; // Safety check
+    // Log if verbose? 
+    // std::cout << "AnalysisEngine: Starting search. Query=" << patternSize << ", Lookahead=" << lookahead << std::endl;
 
-    const std::vector<double> pattern(query.begin(), query.begin() + patternSize);
+    const std::vector<double>& pattern = query;
 
     // Thread-local storage for gathering results
     std::vector<std::vector<SearchResult>> threadResults(omp_get_max_threads());
@@ -135,16 +137,10 @@ std::vector<SearchResult> AnalysisEngine::Search(const std::vector<double>& quer
         int currentScale = 1;
 
         // Loop through scales
-        // Condition: we need at least 400 points (300 match + 100 buffer/future)
-        // Wait, downsampling logic says "3000 -> 1500 ... NOT 375".
-        // The original check was size >= 400. 
-        // With pattern size 300, we need at least 300 points to match.
-        // User implied filtering files < 400.
-        // For search, we extract pattern of 300. So target must be >= 300.
-        // With 100 padding, ideally >= 400.
-        while (currentData.size() >= 400) {
+        // Condition: we need patternSize + lookahead points.
+        while (currentData.size() >= patternSize + lookahead) {
             
-            const int searchLimit = static_cast<int>(currentData.size()) - 100 - static_cast<int>(patternSize);
+            const int searchLimit = static_cast<int>(currentData.size()) - lookahead - static_cast<int>(patternSize);
 
             if (searchLimit >= 0) {
                 double localBestPearson = -1.0;

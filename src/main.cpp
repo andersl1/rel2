@@ -63,6 +63,8 @@ static char g_AlphaApiKey[128] = "";
 static char g_Symbol[32] = "IBM";
 bool g_TestingMode = false;
 bool g_UseFred = false; // Default Off // False = Last 300 (Live), True = First 300 (Testing)
+int g_QuerySize = 300;
+int g_Lookahead = 100;
 std::vector<double> g_StockData;
 std::vector<SearchResult> g_SearchResults;
 std::vector<double> g_PredictionData;
@@ -140,6 +142,50 @@ void LoadTickers() {
     }
 }
 
+void SaveResults(const std::string& folderName) {
+    std::string baseDir = "C:/Users/ander/OneDrive/Documents/REL2/src/simulation_results";
+    std::string fullPath = baseDir + "/" + folderName;
+    
+    // Create directories
+    try {
+        std::filesystem::create_directories(fullPath);
+    } catch (const std::exception& e) {
+        std::cerr << "Error creating directory: " << e.what() << std::endl;
+        return;
+    }
+
+    // Generate Timestamp
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm buf;
+    localtime_s(&buf, &in_time_t);
+    
+    char timeStr[64];
+    std::strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", &buf);
+    
+    // Save Trades CSV
+    std::string csvPath = fullPath + "/trades_" + std::string(timeStr) + ".csv";
+    std::ofstream csv(csvPath);
+    if (csv.is_open()) {
+        csv << "Ticker,Decision,Predicted_EV,Actual_Return,Win,Wallet_Before,Wallet_After\n";
+        
+        std::lock_guard<std::mutex> lock(g_SimMutex);
+        for (const auto& h : g_SimHistory) {
+            csv << h.ticker << ","
+                << h.decision << ","
+                << h.predicted_ev << ","
+                << h.actual_return << ","
+                << (h.win ? "1" : "0") << ","
+                << h.wallet_before << ","
+                << h.wallet_after << "\n";
+        }
+        csv.close();
+        std::cout << "Saved results to " << csvPath << std::endl;
+    } else {
+        std::cerr << "Failed to open CSV file: " << csvPath << std::endl;
+    }
+}
+
 // Simulation Thread Function
 void RunSimulation(std::string apiKey) {
     std::cout << "Simulation Started." << std::endl;
@@ -158,13 +204,28 @@ void RunSimulation(std::string apiKey) {
     std::mt19937 gen(rd());
     
     while (g_SimRunning) {
+        bool resetNeeded = false;
         {
             std::lock_guard<std::mutex> lock(g_SimMutex);
-            if (g_SimStopRequest || g_SimWallet <= 0 || g_SimHistory.size() >= 100) {
+            if (g_SimStopRequest) {
                 g_SimRunning = false;
-                g_SimStatus = "Finished";
+                g_SimStatus = "Stopped";
                 break;
             }
+            if (g_SimWallet <= 0 || g_SimHistory.size() >= 100) {
+                 resetNeeded = true;
+            }
+        }
+        
+        if (resetNeeded) {
+            SaveResults("1_0");
+            
+            std::lock_guard<std::mutex> lock(g_SimMutex);
+            g_SimWallet = 100.0;
+            g_SimHistory.clear();
+            g_SimStatus = "Resetting for new run...";
+            std::this_thread::sleep_for(std::chrono::seconds(2)); // Pause for effect
+            continue;
         }
         
         if (g_TickerList.empty()) {
@@ -195,8 +256,9 @@ void RunSimulation(std::string apiKey) {
             
             // Random Slice (Feature Check)
             int data_size = static_cast<int>(data.size());
-            // Need: 300 for query + 100 for future = 400 total window.
-            int max_start = data_size - 400;
+            // Need: QuerySize for query + Lookahead for future = Total Window
+            int required_window = g_QuerySize + g_Lookahead;
+            int max_start = data_size - required_window;
             if (max_start < 0) { // Safety
                  if (g_SimRateLimit) std::this_thread::sleep_for(std::chrono::seconds(12));
                  continue;
@@ -205,12 +267,12 @@ void RunSimulation(std::string apiKey) {
             std::uniform_int_distribution<> slice_dist(0, max_start);
             int start_idx = slice_dist(gen);
             
-            // Testing Mode: Use Random 300
-            std::vector<double> query(data.begin() + start_idx, data.begin() + start_idx + 300);
+            // Testing Mode: Use Random Slice
+            std::vector<double> query(data.begin() + start_idx, data.begin() + start_idx + g_QuerySize);
             
-            // Actual Future (Index 399 relative to start_idx, i.e., 100 steps ahead of match end)
-            double actual_start = data[start_idx + 299]; // Price at end of query
-            double actual_end = data[start_idx + 399];   // Price 100 days later
+            // Actual Future
+            double actual_start = data[start_idx + g_QuerySize - 1]; // Price at end of query
+            double actual_end = data[start_idx + g_QuerySize + g_Lookahead - 1];   // Price N days later
             double actual_return_pct = (actual_end - actual_start) / actual_start * 100.0;
             
             // Run Search
@@ -219,7 +281,7 @@ void RunSimulation(std::string apiKey) {
                 g_SimStatus = "Analyzing " + ticker + "...";
             }
             
-            std::vector<SearchResult> results = engine.Search(query, false, 35); // topK=35 for better density
+            std::vector<SearchResult> results = engine.Search(query, false, 35, g_Lookahead); // topK=35 for better density
             
             // Calculate EV
             // 1. Query Stats
@@ -246,7 +308,7 @@ void RunSimulation(std::string apiKey) {
                 
                 // Match stats for normalization
                 double seg_sum = 0, seg_sq_sum = 0;
-                int match_len = 300;
+                int match_len = g_QuerySize;
                 if (res.offset + match_len <= (int)scaledData.size()) {
                     for(int k=0; k<match_len; ++k) seg_sum += scaledData[res.offset + k];
                     double seg_mean = seg_sum / match_len;
@@ -257,9 +319,11 @@ void RunSimulation(std::string apiKey) {
                     double seg_stdev = std::sqrt(seg_sq_sum / match_len);
                     if (seg_stdev == 0) seg_stdev = 1.0;
                     
-                    // Future Point (at +399 relative to offset start? i.e. 100 days after match end)
-                    if (res.offset + 399 < (int)scaledData.size()) {
-                        double future_val = scaledData[res.offset + 399];
+                    // Future Point (at +Lookahead relative to offset match end)
+                    // Match is [offset, offset + match_len - 1]. Future is offset + match_len + lookahead - 1
+                    int future_idx = res.offset + match_len + g_Lookahead - 1;
+                    if (future_idx < (int)scaledData.size()) {
+                        double future_val = scaledData[future_idx];
                         double z = (future_val - seg_mean) / seg_stdev;
                         points.push_back({z, res.pearson});
                     }
@@ -343,7 +407,7 @@ void RunSimulation(std::string apiKey) {
     {
         std::lock_guard<std::mutex> lock(g_SimMutex);
         g_SimRunning = false;
-        if (g_SimStatus != "Finished") g_SimStatus = "Stopped";
+        g_SimStatus = "Stopped";
     }
 }
 
@@ -481,12 +545,14 @@ int main(int, char**)
                     ImGui::InputText("API Key", g_AlphaApiKey, sizeof(g_AlphaApiKey), ImGuiInputTextFlags_Password);
                     ImGui::InputText("Symbol", g_Symbol, sizeof(g_Symbol));
                     
-                    ImGui::Checkbox("Testing Mode (Use First 300 pts)", &g_TestingMode);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("If checked, uses FIRST 300 points. Default (Unchecked) is LAST 300 points.");
+                    ImGui::Checkbox("Testing Mode (Use First N pts)", &g_TestingMode);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("If checked, uses FIRST 'Query Size' points. Default (Unchecked) is LAST 'Query Size' points.");
                     
                     ImGui::SameLine();
-                    ImGui::Checkbox("Include FRED Data", &g_UseFred);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include 100,000+ Economic Series from FRED in the search (Slower).");
+                    ImGui::Checkbox("Include FRED", &g_UseFred);
+                    
+                    ImGui::SliderInt("Query Size", &g_QuerySize, 100, 500);
+                    ImGui::SliderInt("Lookahead", &g_Lookahead, 10, 200);
 
                     // Persistent Query Segment for plotting (updated on fetch)
                     static std::vector<double> s_DisplayQuery;
@@ -512,25 +578,25 @@ int main(int, char**)
                                 g_StockData = AlphaVantage::FetchDaily(g_Symbol, g_AlphaApiKey);
                                 
                                 // 3. Search
-                                if (g_StockData.size() >= 300) {
+                                if (g_StockData.size() >= (size_t)(g_QuerySize)) {
                                     g_AlphaStatus = "Running OpenMP Search...";
                                     
                                     // EXTRACT QUERY PATTERN BASED ON MODE
                                     std::vector<double> searchPattern;
                                     if (g_TestingMode) {
-                                        // First 300 for searching
-                                        searchPattern.assign(g_StockData.begin(), g_StockData.begin() + 300);
-                                        // First 400 for Display (if available, to show "actual" future)
-                                        int dispLen = std::min((int)g_StockData.size(), 400);
+                                        // First N for searching
+                                        searchPattern.assign(g_StockData.begin(), g_StockData.begin() + g_QuerySize);
+                                        // First N+Lookahead for Display
+                                        int dispLen = std::min((int)g_StockData.size(), g_QuerySize + g_Lookahead);
                                         s_DisplayQuery.assign(g_StockData.begin(), g_StockData.begin() + dispLen);
                                     } else {
-                                        // Last 300 for searching AND display
-                                        searchPattern.assign(g_StockData.end() - 300, g_StockData.end());
+                                        // Last N for searching AND display
+                                        searchPattern.assign(g_StockData.end() - g_QuerySize, g_StockData.end());
                                         s_DisplayQuery = searchPattern;
                                     }
                                     
                                     // 4. Search and Calculate Prediction
-                                    g_SearchResults = engine.Search(searchPattern, g_UseFred, 35);
+                                    g_SearchResults = engine.Search(searchPattern, g_UseFred, 35, g_Lookahead);
                                     g_AlphaStatus = "Found Top 10 Matches.";
 
                                     g_PredictionData.clear();
@@ -573,11 +639,11 @@ int main(int, char**)
                                                     double v = scaledData[res.offset + k];
                                                     seg_sq_sum += (v - seg_mean)*(v - seg_mean);
                                                 }
-                                                double seg_stdev = std::sqrt(seg_sq_sum / 300.0);
+                                                double seg_stdev = std::sqrt(seg_sq_sum / static_cast<double>(g_QuerySize));
                                                 if (seg_stdev == 0) seg_stdev = 1.0;
 
                                                 // --- 1. Store Normalized Full Segment for Median ---
-                                                int len = 400; 
+                                                int len = g_QuerySize + g_Lookahead; 
                                                 if (res.offset + len > (int)scaledData.size()) len = (int)scaledData.size() - res.offset;
                                                 
                                                 std::vector<double> norm_full;
@@ -611,7 +677,7 @@ int main(int, char**)
                                         
                                         // Calculate Median Line
                                         if (!allSegments.empty()) {
-                                            for (int t = 0; t < 400; ++t) {
+                                            for (int t = 0; t < g_QuerySize + g_Lookahead; ++t) {
                                                 std::vector<double> vals;
                                                 for (const auto& seg : allSegments) {
                                                     if (t < (int)seg.size()) vals.push_back(seg[t]);
@@ -692,7 +758,8 @@ int main(int, char**)
                                         }
 
                                         int start = res.offset;
-                                        int len = 400; // 300 match + 100 future
+                                        // 300 (match) + 100 (future) -> g_QuerySize + g_Lookahead
+                                        int len = g_QuerySize + g_Lookahead; 
                                         if (start + len > (int)scaledData.size()) len = (int)scaledData.size() - start;
                                         
                                         if (len > 0) {
@@ -731,7 +798,7 @@ int main(int, char**)
                                 }
 
                                 // Match Query Stats for Normalization
-                                int patternLen = std::min((int)s_DisplayQuery.size(), 300);
+                                int patternLen = std::min((int)s_DisplayQuery.size(), g_QuerySize);
                                 double sum = 0.0;
                                 for(int i=0; i<patternLen; ++i) sum += s_DisplayQuery[i];
                                 double mean = sum / patternLen;
@@ -747,16 +814,11 @@ int main(int, char**)
                                 ImPlot::SetNextLineStyle(ImVec4(0.1f, 1.0f, 1.0f, 1.0f), 1.5f); // Bright Cyan
                                 ImPlot::PlotLine("Query", normQuery.data(), static_cast<int>(normQuery.size()));
 
-                                // 3. Prediction
-                                if (!g_PredictionData.empty()) {
-                                    std::vector<double> normPred;
-                                    for (double v : g_PredictionData) normPred.push_back((v - mean) / stdev);
-                                    ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 1.5f); // Gold
-                                    ImPlot::PlotLine("Prediction (Avg)", normPred.data(), static_cast<int>(normPred.size()), 1.0, 300.0);
-                                }
+                                // 3. Prediction (Removed as requested)
+                                // if (!g_PredictionData.empty()) { ... }
                                 
                                 // 4. Prediction Zone Line
-                                double cutoff = 300.0;
+                                double cutoff = (double)g_QuerySize;
                                 ImPlot::PlotInfLines("Prediction", &cutoff, 1);
 
                                 ImPlot::EndPlot();
@@ -769,7 +831,7 @@ int main(int, char**)
                                 
                                 if (!g_FuturePoints.empty()) {
                                     // 1. Calculate Query Stats (Same as Main Plot)
-                                    int patternLen = std::min((int)s_DisplayQuery.size(), 300);
+                                    int patternLen = std::min((int)s_DisplayQuery.size(), g_QuerySize);
                                     double sum = 0.0;
                                     for(int i=0; i<patternLen; ++i) sum += s_DisplayQuery[i];
                                     double mean = sum / patternLen;
@@ -863,6 +925,9 @@ int main(int, char**)
                     ImGui::InputText("API Key", g_AlphaApiKey, sizeof(g_AlphaApiKey), ImGuiInputTextFlags_Password);
                     ImGui::Checkbox("Rate Limit (Free Tier - 12s delay)", &g_SimRateLimit);
                     
+                    ImGui::SliderInt("Query Size", &g_QuerySize, 100, 500);
+                    ImGui::SliderInt("Lookahead", &g_Lookahead, 10, 200);
+
                     ImGui::Separator();
                     
                     { // Lock for reading UI state
@@ -925,8 +990,8 @@ int main(int, char**)
                         ImGui::TextColored(ImVec4(1, 1, 0, 1), "Wins: %d | Losses: %d | Ratio: %.1f%%", wins, losses, ratio);
                         
                         if (x.size() > 1) {
-                             // ImVec2(-1, -1) will use all remaining width and height
-                             if (ImPlot::BeginPlot("Equity Curve", ImVec2(-1, -1))) {
+                             // ImVec2(-1, 350) keeps it large but leaves room for the table
+                             if (ImPlot::BeginPlot("Equity Curve", ImVec2(-1, 450))) {
                                  ImPlot::SetupAxes("Trades", "Wallet ($)");
                                  ImPlot::PlotLine("Value", x.data(), y.data(), static_cast<int>(x.size()));
                                  ImPlot::EndPlot();
